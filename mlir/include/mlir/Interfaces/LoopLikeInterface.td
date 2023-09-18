@@ -36,14 +36,14 @@ def LoopLikeOpInterface : OpInterface<"LoopLikeOpInterface"> {
       /*args=*/(ins "::mlir::Value ":$value),
       /*methodBody=*/"",
       /*defaultImplementation=*/[{
-        return value.getParentRegion()->isProperAncestor(&$_op.getLoopBody());
+        return !$_op->isAncestor(value.getParentRegion()->getParentOp());
       }]
     >,
     InterfaceMethod<[{
-        Returns the region that makes up the body of the loop and should be
+        Returns the regions that make up the body of the loop and should be
         inspected for loop-invariant operations.
       }],
-      /*retTy=*/"::mlir::Region &",
+      /*retTy=*/"::llvm::SmallVector<::mlir::Region *>",
       /*methodName=*/"getLoopBody"
     >,
     InterfaceMethod<[{

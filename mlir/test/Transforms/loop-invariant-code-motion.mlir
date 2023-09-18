@@ -929,3 +929,24 @@ func.func @speculate_dynamic_pack_and_unpack(%source: tensor<?x?xf32>,
   }
   return
 }
+
+// -----
+
+// CHECK-LABEL: func @hoist_from_scf_while(
+//   CHECK-DAG:   arith.constant 1 : i32
+//   CHECK-DAG:   arith.constant 10 : i32
+//       CHECK:   scf.while
+//   CHECK-NOT:     arith.constant
+func.func @hoist_from_scf_while(%arg0: i32) -> i32 {
+  %0 = scf.while (%arg1 = %arg0) : (i32) -> (i32) {
+    %c10 = arith.constant 10 : i32
+    %1 = arith.cmpi slt, %arg1, %c10 : i32
+    scf.condition(%1) %arg1 : i32
+  } do {
+  ^bb0(%arg1: i32):
+    %c1 = arith.constant 1 : i32
+    %added = arith.addi %c1, %arg1 : i32
+    scf.yield %added : i32
+  }
+  return %0 : i32
+}

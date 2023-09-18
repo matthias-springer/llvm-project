@@ -184,7 +184,8 @@ mlir::memref::multiBuffer(RewriterBase &rewriter, memref::AllocOp allocOp,
 
   // 3. Within the loop, build the modular leading index (i.e. each loop
   // iteration %iv accesses slice ((%iv - %lb) / %step) % %mb_factor).
-  rewriter.setInsertionPointToStart(&candidateLoop.getLoopBody().front());
+  rewriter.setInsertionPointToStart(
+      &candidateLoop.getLoopBody().front()->front());
   Value ivVal = *inductionVar;
   Value lbVal = getValueOrCreateConstantIndexOp(rewriter, loc, *lowerBound);
   Value stepVal = getValueOrCreateConstantIndexOp(rewriter, loc, *singleStep);

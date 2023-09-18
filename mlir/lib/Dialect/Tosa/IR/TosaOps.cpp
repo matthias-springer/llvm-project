@@ -69,7 +69,7 @@ struct TosaInlinerInterface : public DialectInlinerInterface {
 //===----------------------------------------------------------------------===//
 
 /// Returns the while loop body.
-Region &tosa::WhileOp::getLoopBody() { return getBody(); }
+SmallVector<Region *> tosa::WhileOp::getLoopBody() { return {&getBody()}; }
 
 //===----------------------------------------------------------------------===//
 // Tosa dialect initialization.
