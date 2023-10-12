@@ -198,6 +198,8 @@ void ValueBoundsConstraintSet::processWorklist(StopConditionFn stopCondition) {
       } else {
         valueBoundsOp.populateBoundsForShapedValueDim(value, dim, *this);
       }
+      llvm::errs() << "\n\nafter: " << value << "\n";
+      cstr.dump();
       continue;
     }
 
