@@ -494,10 +494,10 @@ void transform::TransformState::recordOpHandleInvalidationOne(
   unsigned operandNo = consumingHandle.getOperandNumber();
   for (Operation *ancestor : potentialAncestors) {
     // clang-format off
-    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL, 
+    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
       { (DBGS() << "----handle one ancestor: " << *ancestor << "\n"); });
-    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL, 
-      { (DBGS() << "----of payload with name: " 
+    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
+      { (DBGS() << "----of payload with name: "
                 << payloadOp->getName().getIdentifier() << "\n"); });
     DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
       { (DBGS() << "----of payload: " << *payloadOp << "\n"); });
@@ -888,7 +888,8 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
                 emitDefiniteFailure(transform->getLoc())
                 << "expensive checks failure: operation mismatch, expected "
                 << insertion.first->second;
-            diag.attachNote(op->getLoc()) << "payload op: " << op->getName();
+            diag.attachNote(op->getLoc())
+                << "payload op [" << op->getName() << "]";
             return diag;
           }
         }
@@ -1029,6 +1030,21 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
       cachedNames.erase(op);
     }
 
+    // Only mapped payload ops should be in the cache. Unmapped ops in the cache
+    // could indicate incorrect side effects on transform ops.
+    for (auto it : cachedNames) {
+      SmallVector<Value> handles;
+      if (failed(getHandlesForPayloadOp(it.first, handles,
+                                        /*includeOutOfScope=*/true))) {
+        DiagnosedDefiniteFailure diag =
+            emitDefiniteFailure(transform->getLoc())
+            << "expensive checks failure: unmapped operation found in cache";
+        diag.attachNote(it.first->getLoc())
+            << "payload op [" << it.first->getName() << "]";
+        return diag;
+      }
+    }
+
     // Check cached operation names.
     for (std::unique_ptr<Mappings> &mapping :
          llvm::make_second_range(mappings)) {
@@ -1041,7 +1057,8 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
           DiagnosedDefiniteFailure diag =
               emitDefiniteFailure(transform->getLoc())
               << "expensive checks failure: operation not found in cache";
-          diag.attachNote(op->getLoc()) << "payload op";
+          diag.attachNote(op->getLoc())
+              << "payload op [" << op->getName() << "]";
           return diag;
         }
         // If the `getName` call (or the above `attachNote`) is crashing, we
@@ -1053,7 +1070,8 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
               emitDefiniteFailure(transform->getLoc())
               << "expensive checks failure: operation mismatch, expected "
               << cacheIt->second;
-          diag.attachNote(op->getLoc()) << "payload op: " << op->getName();
+          diag.attachNote(op->getLoc())
+              << "payload op [" << op->getName() << "]";
           return diag;
         }
       }
