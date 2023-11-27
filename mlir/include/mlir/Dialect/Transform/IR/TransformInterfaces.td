@@ -110,6 +110,11 @@ def TransformOpInterface : OpInterface<"TransformOpInterface"> {
     ::llvm::SmallVector<OpOperand *> getConsumedHandleOpOperands() {
       return ::mlir::transform::detail::getConsumedHandleOpOperands($_op);
     }
+
+    /// Returns all results that are handles and being produced by this op.
+    ::llvm::SmallVector<OpResult> getProducedHandleOpResults() {
+      return ::mlir::transform::detail::getProducedHandleOpResults($_op);
+    }
   }];
 
   let verify = [{

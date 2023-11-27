@@ -70,6 +70,10 @@ TransformState makeTransformStateForTesting(Region *region,
 /// Returns all operands that are handles and being consumed by the given op.
 SmallVector<OpOperand *>
 getConsumedHandleOpOperands(transform::TransformOpInterface transformOp);
+
+/// Returns all results that are handles and being produced by the given op.
+SmallVector<OpResult>
+getProducedHandleOpResults(transform::TransformOpInterface transformOp);
 } // namespace detail
 } // namespace transform
 } // namespace mlir

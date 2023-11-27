@@ -30,6 +30,19 @@
 
 using namespace mlir;
 
+/// Return true if `a` happens before `b`, i.e., `a` or one of its ancestors
+/// properly dominates `b` and `b` is not inside `a`.
+static bool happensBefore(Operation *a, Operation *b) {
+  do {
+    if (a->isProperAncestor(b))
+      return false;
+    if (Operation *bAncestor = a->getBlock()->findAncestorOpInBlock(*b)) {
+      return a->isBeforeInBlock(bAncestor);
+    }
+  } while ((a = a->getParentOp()));
+  return false;
+}
+
 //===----------------------------------------------------------------------===//
 // TransformState
 //===----------------------------------------------------------------------===//
@@ -308,8 +321,16 @@ void transform::TransformState::forgetMapping(Value opHandle,
                                               ValueRange origOpFlatResults,
                                               bool allowOutOfScope) {
   Mappings &mappings = getMapping(opHandle, allowOutOfScope);
-  for (Operation *op : mappings.direct[opHandle])
+  for (Operation *op : mappings.direct[opHandle]) {
+#ifdef LLVM_ENABLE_ABI_BREAKING_CHECKS
+    if (options.getExpensiveChecksEnabled()) {
+      op->walk([&](Operation *op) {
+        cachedNames.erase(op);
+      });
+    }
+#endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
     dropMappingEntry(mappings.reverse, op, opHandle);
+  }
   mappings.direct.erase(opHandle);
 #ifdef LLVM_ENABLE_ABI_BREAKING_CHECKS
   // Payload IR is removed from the mapping. This invalidates the respective
@@ -494,10 +515,10 @@ void transform::TransformState::recordOpHandleInvalidationOne(
   unsigned operandNo = consumingHandle.getOperandNumber();
   for (Operation *ancestor : potentialAncestors) {
     // clang-format off
-    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL, 
+    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
       { (DBGS() << "----handle one ancestor: " << *ancestor << "\n"); });
-    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL, 
-      { (DBGS() << "----of payload with name: " 
+    DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
+      { (DBGS() << "----of payload with name: "
                 << payloadOp->getName().getIdentifier() << "\n"); });
     DEBUG_WITH_TYPE(DEBUG_TYPE_FULL,
       { (DBGS() << "----of payload: " << *payloadOp << "\n"); });
@@ -815,6 +836,8 @@ void transform::TransformState::compactOpHandles() {
 
 DiagnosedSilenceableFailure
 transform::TransformState::applyTransform(TransformOpInterface transform) {
+  llvm::errs() << "\n\napplying: " << transform << "\n";
+
   LLVM_DEBUG({
     DBGS() << "applying: ";
     transform->print(llvm::dbgs(), OpPrintingFlags().skipRegions());
@@ -908,23 +931,11 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
   // IR after that.
   SmallVector<Value> origOpFlatResults;
   SmallVector<Operation *> origAssociatedOps;
-#if LLVM_ENABLE_ABI_BREAKING_CHECKS
-  DenseSet<Operation *> consumedPayloadOps;
-#endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
   for (OpOperand *opOperand : consumedOperands) {
     Value operand = opOperand->get();
     if (llvm::isa<TransformHandleTypeInterface>(operand.getType())) {
-      for (Operation *payloadOp : getPayloadOps(operand)) {
+      for (Operation *payloadOp : getPayloadOps(operand))
         llvm::append_range(origOpFlatResults, payloadOp->getResults());
-#if LLVM_ENABLE_ABI_BREAKING_CHECKS
-        if (options.getExpensiveChecksEnabled()) {
-          // Store all consumed payload ops (and their nested ops) in a set for
-          // extra error checking.
-          payloadOp->walk(
-              [&](Operation *op) { consumedPayloadOps.insert(op); });
-        }
-#endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
-      }
       continue;
     }
     if (llvm::isa<TransformValueHandleTypeInterface>(operand.getType())) {
@@ -1004,65 +1015,75 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
     }
   }
 
+  // Helper function to check if the handle is alive.
+  auto firstAliveUser = [&](Value v) -> std::optional<OpOperand *> {
+    for (OpOperand &use : v.getUses())
+      if (use.getOwner() != transform &&
+          !happensBefore(use.getOwner(), transform))
+        return &use;
+    return std::nullopt;
+  };
+
+  // Forget handles that have no further uses.
+  for (OpOperand &opOperand : transform->getOpOperands()) {
+    Value operand = opOperand.get();
+    if (firstAliveUser(operand))
+      continue;
+    if (llvm::isa<TransformHandleTypeInterface>(operand.getType())) {
+      forgetMapping(operand, {});
+    } else if (llvm::isa<TransformValueHandleTypeInterface>(
+                   operand.getType())) {
+      forgetValueMapping(operand, {});
+    }
+  }
+
+  if (failed(updateStateFromResults(results, transform->getResults())))
+    return DiagnosedSilenceableFailure::definiteFailure();
+
 #if LLVM_ENABLE_ABI_BREAKING_CHECKS
   if (options.getExpensiveChecksEnabled()) {
-    // Remove erased ops from the transform state.
-    for (Operation *op : consumedPayloadOps) {
-      // This payload op was consumed but it may still be mapped to one or
-      // multiple handles. Forget all handles that are mapped to the op, so that
-      // there are no dangling pointers in the transform dialect state. This is
-      // necessary so that the `cachedNames`-based checks work correctly.
-      //
-      // Note: Dangling pointers to erased payload ops are allowed if the
-      // corresponding handles are not used anymore. There is another
-      // "expensive-check" that looks for future uses of dangling payload op
-      // pointers (through arbitrary handles). Removing handles to erased ops
-      // does not interfere with the other expensive checks: handle invalidation
-      // happens earlier and keeps track of invalidated handles with
-      // pre-generated error messages, so we do not need the association to
-      // still be there when the invalidated handle is accessed.
-      SmallVector<Value> handles;
-      (void)getHandlesForPayloadOp(op, handles, /*includeOutOfScope=*/true);
-      for (Value handle : handles)
-        forgetMapping(handle, /*origOpFlatResults=*/ValueRange(),
-                      /*allowOutOfScope=*/true);
-      cachedNames.erase(op);
-    }
-
     // Check cached operation names.
     for (std::unique_ptr<Mappings> &mapping :
          llvm::make_second_range(mappings)) {
-      for (Operation *op : llvm::make_first_range(mapping->reverse)) {
-        // Make sure that the name of the op has not changed. If it has changed,
-        // the op was removed and a new op was allocated at the same memory
-        // location. This means that we are missing op tracking somewhere.
-        auto cacheIt = cachedNames.find(op);
-        if (cacheIt == cachedNames.end()) {
-          DiagnosedDefiniteFailure diag =
-              emitDefiniteFailure(transform->getLoc())
-              << "expensive checks failure: operation not found in cache";
-          diag.attachNote(op->getLoc()) << "payload op";
-          return diag;
-        }
-        // If the `getName` call (or the above `attachNote`) is crashing, we
-        // have a dangling pointer. This usually means that an op was erased but
-        // the transform dialect was not made aware of that; e.g., missing
-        // "consumesHandle" or rewriter usage.
-        if (cacheIt->second != op->getName()) {
-          DiagnosedDefiniteFailure diag =
-              emitDefiniteFailure(transform->getLoc())
-              << "expensive checks failure: operation mismatch, expected "
-              << cacheIt->second;
-          diag.attachNote(op->getLoc()) << "payload op: " << op->getName();
-          return diag;
+      // TODO: Skip invalidated handles
+      //invalidatedHandles
+      for (auto it : mapping->direct) {
+      //for (auto it : mapping->reverse) {
+        if (invalidatedHandles.find(it.first) != invalidatedHandles.end())
+          continue;
+        llvm::errs() << "check handle: " << it.first << "\n";
+        for (Operation *op : it.second) {
+          // Make sure that the name of the op has not changed. If it has changed,
+          // the op was removed and a new op was allocated at the same memory
+          // location. This means that we are missing op tracking somewhere.
+          auto cacheIt = cachedNames.find(op);
+          if (cacheIt == cachedNames.end()) {
+            llvm::errs() << "NOT FOUND: " << *op << "\n";
+            llvm::errs() << "NUM HANDLES: " << it.second.size() << "\n";
+            llvm::errs() << " -- FIRST: " << it.second[0] << "\n";
+            DiagnosedDefiniteFailure diag =
+                emitDefiniteFailure(transform->getLoc())
+                << "expensive checks failure: operation not found in cache 2";
+            diag.attachNote(op->getLoc()) << "payload op";
+            return diag;
+          }
+          // If the `getName` call (or the above `attachNote`) is crashing, we
+          // have a dangling pointer. This usually means that an op was erased but
+          // the transform dialect was not made aware of that; e.g., missing
+          // "consumesHandle" or rewriter usage.
+          if (cacheIt->second != op->getName()) {
+            DiagnosedDefiniteFailure diag =
+                emitDefiniteFailure(transform->getLoc())
+                << "expensive checks failure: operation mismatch, expected "
+                << cacheIt->second;
+            diag.attachNote(op->getLoc()) << "payload op: " << op->getName();
+            return diag;
+          }
         }
       }
     }
   }
 #endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
-
-  if (failed(updateStateFromResults(results, transform->getResults())))
-    return DiagnosedSilenceableFailure::definiteFailure();
 
   printOnFailureRAII.release();
   DEBUG_WITH_TYPE(DEBUG_PRINT_AFTER_ALL, {
@@ -1075,6 +1096,8 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
 LogicalResult transform::TransformState::updateStateFromResults(
     const TransformResults &results, ResultRange opResults) {
   for (OpResult result : opResults) {
+    if (result.getUses().empty())
+      continue;
     if (llvm::isa<TransformParamTypeInterface>(result.getType())) {
       assert(results.isParam(result.getResultNumber()) &&
              "expected parameters for the parameter-typed result");
@@ -1096,6 +1119,25 @@ LogicalResult transform::TransformState::updateStateFromResults(
               setPayloadOps(result, results.get(result.getResultNumber())))) {
         return failure();
       }
+
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+      if (options.getExpensiveChecksEnabled()) {
+        for (Operation *op : results.get(result.getResultNumber())) {
+          auto insertion = cachedNames.insert({op, op->getName()});
+          if (!insertion.second) {
+            if (insertion.first->second != op->getName()) {
+              // Operation is already in the cache, but with a different name.
+              DiagnosedDefiniteFailure diag =
+                  emitDefiniteFailure(result.getLoc())
+                  << "expensive checks failure: operation mismatch, expected "
+                  << insertion.first->second;
+              diag.attachNote(op->getLoc()) << "payload op: " << op->getName();
+              return diag;
+            }
+          }
+        }
+      }
+#endif // LLVM_ENABLE_ABI_BREAKING_CHECKS
     }
   }
   return success();
@@ -1367,19 +1409,6 @@ void transform::TrackingListener::notifyOperationRemoved(Operation *op) {
     // Remove mapping for op.
     (void)replacePayloadOp(op, nullptr);
   });
-}
-
-/// Return true if `a` happens before `b`, i.e., `a` or one of its ancestors
-/// properly dominates `b` and `b` is not inside `a`.
-static bool happensBefore(Operation *a, Operation *b) {
-  do {
-    if (a->isProperAncestor(b))
-      return false;
-    if (Operation *bAncestor = a->getBlock()->findAncestorOpInBlock(*b)) {
-      return a->isBeforeInBlock(bAncestor);
-    }
-  } while ((a = a->getParentOp()));
-  return false;
 }
 
 void transform::TrackingListener::notifyOperationReplaced(
@@ -2010,6 +2039,27 @@ SmallVector<OpOperand *> transform::detail::getConsumedHandleOpOperands(
     }
   }
   return consumedOperands;
+}
+
+SmallVector<OpResult> transform::detail::getProducedHandleOpResults(
+    TransformOpInterface transformOp) {
+  SmallVector<OpResult> producedResults;
+  producedResults.reserve(transformOp->getNumResults());
+  auto memEffectInterface =
+      cast<MemoryEffectOpInterface>(transformOp.getOperation());
+  SmallVector<MemoryEffects::EffectInstance, 2> effects;
+  for (OpResult target : transformOp->getOpResults()) {
+    effects.clear();
+    memEffectInterface.getEffectsOnValue(target, effects);
+    if (llvm::any_of(effects, [](const MemoryEffects::EffectInstance &effect) {
+          return isa<transform::TransformMappingResource>(
+                     effect.getResource()) &&
+                 isa<MemoryEffects::Allocate>(effect.getEffect());
+        })) {
+      producedResults.push_back(target);
+    }
+  }
+  return producedResults;
 }
 
 LogicalResult transform::detail::verifyTransformOpInterface(Operation *op) {
