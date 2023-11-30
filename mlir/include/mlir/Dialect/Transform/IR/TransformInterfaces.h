@@ -923,11 +923,22 @@ TransformState::RegionScope TransformState::make_region_scope(Region &region) {
 /// A listener that updates a TransformState based on IR modifications. This
 /// listener can be used during a greedy pattern rewrite to keep the transform
 /// state up-to-date.
+///
+/// Op/value replacements are not immediately reflected in the TransformState.
+/// This happens only when the replacements are "committed", which is typically
+/// after the application of a transform op.
 class TrackingListener : public RewriterBase::Listener,
                          public TransformState::Extension {
 public:
   /// Create a new TrackingListener for usage in the specified transform op.
   TrackingListener(TransformState &state, TransformOpInterface op);
+
+  /// Destructor. Asserts that all op/value replacements have been committed.
+  ~TrackingListener() override;
+
+  /// Commit all op/value replacements to be reflected in the transform state's
+  /// mapping data structure. Clears all replacement pairs for this listener.
+  void commitReplacements();
 
 protected:
   /// Return a replacement payload op for the given op, which is going to be
@@ -1010,11 +1021,30 @@ private:
   void notifyOperationReplaced(Operation *op, ValueRange newValues) override;
   using Listener::notifyOperationReplaced;
 
+  /// Register an op replacement in `payloadOpReplacements`.
+  void registerReplacement(Operation *from, Operation *to);
+
+  /// Register a value replacement in `payloadValueReplacements`.
+  void registerReplacement(Value from, Value to);
+
+  /// Get all handles for the given payload op. This function takes into account
+  /// any op replacements that were recorded by this TrackingListener but not
+  /// yet committed to the TransformState.
+  SmallVector<Value> getHandlesForPayloadOp(Operation *op);
+
   /// The transform op in which this TrackingListener is used.
   TransformOpInterface transformOp;
 
   /// The handles that are consumed by the transform op.
   DenseSet<Value> consumedHandles;
+
+  /// Mapping of ops before the application of the transform op to ops after the
+  /// application of the transform op.
+  DenseMap<Operation *, Operation *> payloadOpReplacements;
+
+  /// Mapping of values before the application of the transform op to values
+  /// after the application of the transform op.
+  DenseMap<Value, Value> payloadValueReplacements;
 };
 
 /// A specialized listener that keeps track of cases in which no replacement

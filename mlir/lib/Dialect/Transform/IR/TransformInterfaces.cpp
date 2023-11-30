@@ -367,15 +367,6 @@ transform::TransformState::replacePayloadOp(Operation *op,
                                             Operation *replacement) {
   // TODO: consider invalidating the handles to nested objects here.
 
-#ifndef NDEBUG
-  for (Value opResult : op->getResults()) {
-    SmallVector<Value> valueHandles;
-    (void)getHandlesForPayloadValue(opResult, valueHandles,
-                                    /*includeOutOfScope=*/true);
-    assert(valueHandles.empty() && "expected no mapping to old results");
-  }
-#endif // NDEBUG
-
   // Drop the mapping between the op and all handles that point to it. Fail if
   // there are no handles.
   SmallVector<Value> opHandles;
@@ -908,6 +899,7 @@ transform::TransformState::applyTransform(TransformOpInterface transform) {
   // proceed on a best effort basis.
   transform::TransformResults results(transform->getNumResults());
   DiagnosedSilenceableFailure result(transform.apply(rewriter, results, *this));
+  trackingListener.commitReplacements();
   compactOpHandles();
 
   // Error handling: fail if transform or listener failed.
@@ -1245,9 +1237,9 @@ void transform::TrackingListener::notifyOperationRemoved(Operation *op) {
   op->walk([&](Operation *op) {
     // Remove mappings for result values.
     for (OpResult value : op->getResults())
-      (void)replacePayloadValue(value, nullptr);
+      registerReplacement(value, Value());
     // Remove mapping for op.
-    (void)replacePayloadOp(op, nullptr);
+    registerReplacement(op, nullptr);
   });
 }
 
@@ -1264,6 +1256,32 @@ static bool happensBefore(Operation *a, Operation *b) {
   return false;
 }
 
+SmallVector<Value>
+transform::TrackingListener::getHandlesForPayloadOp(Operation *op) {
+  SmallVector<Value> opHandles;
+
+  // Find all ops that `op` used to correspond to, before any IR modifications
+  // that were recorded by this listener. Gather all handles of these ops.
+  bool wasReplaced = false;
+  for (auto it : payloadOpReplacements) {
+    if (it.second != op)
+      continue;
+    wasReplaced = true;
+    SmallVector<Value> nextHandles;
+    (void)getTransformState().getHandlesForPayloadOp(
+        it.first, nextHandles, /*includeOutOfScope=*/true);
+    llvm::append_range(opHandles, nextHandles);
+  }
+
+  if (!wasReplaced) {
+    // TODO: Always include these handles?
+    (void)getTransformState().getHandlesForPayloadOp(
+        op, opHandles, /*includeOutOfScope=*/true);
+  }
+
+  return opHandles;
+}
+
 void transform::TrackingListener::notifyOperationReplaced(
     Operation *op, ValueRange newValues) {
   assert(op->getNumResults() == newValues.size() &&
@@ -1271,12 +1289,11 @@ void transform::TrackingListener::notifyOperationReplaced(
 
   // Replace value handles.
   for (auto [oldValue, newValue] : llvm::zip(op->getResults(), newValues))
-    (void)replacePayloadValue(oldValue, newValue);
+    registerReplacement(oldValue, newValue);
 
   // Replace op handle.
-  SmallVector<Value> opHandles;
-  if (failed(getTransformState().getHandlesForPayloadOp(
-          op, opHandles, /*includeOutOfScope=*/true))) {
+  SmallVector<Value> opHandles = getHandlesForPayloadOp(op);
+  if (opHandles.empty()) {
     // Op is not tracked.
     return;
   }
@@ -1309,7 +1326,7 @@ void transform::TrackingListener::notifyOperationReplaced(
   if (!firstAliveUser.has_value() || handleWasConsumed()) {
     // The op is tracked but the corresponding handles are dead or were
     // consumed. Drop the op form the mapping.
-    (void)replacePayloadOp(op, nullptr);
+    registerReplacement(op, nullptr);
     return;
   }
 
@@ -1324,11 +1341,49 @@ void transform::TrackingListener::notifyOperationReplaced(
         << "(first use in this op as operand number "
         << (*firstAliveUser)->getOperandNumber() << ")";
     notifyPayloadReplacementNotFound(op, newValues, std::move(diag));
-    (void)replacePayloadOp(op, nullptr);
+    registerReplacement(op, nullptr);
     return;
   }
 
-  (void)replacePayloadOp(op, replacement);
+  registerReplacement(op, replacement);
+}
+
+void transform::TrackingListener::registerReplacement(Operation *from,
+                                                      Operation *to) {
+  assert(from && "expected non-null 'from' operation");
+  // TODO: Add reverse mapping if this loop becomes a bottleneck.
+  for (auto it : payloadOpReplacements) {
+    if (it.second == from)
+      it.second = to;
+  }
+  if (payloadOpReplacements.find(from) == payloadOpReplacements.end())
+    payloadOpReplacements[from] = to;
+}
+
+void transform::TrackingListener::registerReplacement(Value from, Value to) {
+  assert(from && "expected non-null 'from' value");
+  // TODO: Add reverse mapping if this loop becomes a bottleneck.
+  for (auto it : payloadValueReplacements) {
+    if (it.second == from)
+      it.second = to;
+  }
+  if (payloadValueReplacements.find(from) == payloadValueReplacements.end())
+    payloadValueReplacements[from] = to;
+}
+
+transform::TrackingListener::~TrackingListener() {
+  assert(payloadOpReplacements.empty() && "uncommitted op replacements found");
+  assert(payloadValueReplacements.empty() &&
+         "uncommitted value replacements found");
+}
+
+void transform::TrackingListener::commitReplacements() {
+  for (auto it : payloadValueReplacements)
+    (void)replacePayloadValue(it.first, it.second);
+  payloadValueReplacements.clear();
+  for (auto it : payloadOpReplacements)
+    (void)replacePayloadOp(it.first, it.second);
+  payloadOpReplacements.clear();
 }
 
 transform::ErrorCheckingTrackingListener::~ErrorCheckingTrackingListener() {
