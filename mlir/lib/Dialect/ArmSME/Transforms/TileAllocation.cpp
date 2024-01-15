@@ -223,11 +223,6 @@ struct AssignTileIDsPattern
     if (failed(tileId))
       return tileOp.emitError("ran out of SME virtual tiles!");
 
-    rewriter.updateRootInPlace(func, [&]() {
-      func->setDiscardableAttr(
-          kTilesInUseAttr, rewriter.getI32IntegerAttr((unsigned)tilesInUse));
-    });
-
     // Find all the ops that (transitively) depend on this tile.
     SetVector<Operation *> dependantOps;
     findDependantOps(tileOp->getResult(0), dependantOps);
@@ -247,17 +242,24 @@ struct AssignTileIDsPattern
     // scf.if, and moving the contents of %tileA or %tileB to result tile (based
     // on the %some_cond).
     auto tileIDAttr = rewriter.getI32IntegerAttr(*tileId);
-    rewriter.updateRootInPlace(tileOp, [&]() { tileOp.setTileId(tileIDAttr); });
     for (auto *op : dependantOps) {
       if (auto tileOp = llvm::dyn_cast<ArmSMETileOpInterface>(op)) {
         auto currentTileId = tileOp.getTileId();
         if (currentTileId && unsigned(currentTileId.getInt()) != tileId)
           return tileOp.emitOpError(
               "already assigned different SME virtual tile!");
-        rewriter.updateRootInPlace(tileOp,
-                                   [&]() { tileOp.setTileId(tileIDAttr); });
       }
     }
+
+    rewriter.updateRootInPlace(tileOp, [&]() { tileOp.setTileId(tileIDAttr); });
+    for (Operation *op : dependantOps)
+      if (auto tileOp = llvm::dyn_cast<ArmSMETileOpInterface>(op))
+        rewriter.updateRootInPlace(tileOp,
+                                   [&]() { tileOp.setTileId(tileIDAttr); });
+    rewriter.updateRootInPlace(func, [&]() {
+      func->setDiscardableAttr(
+          kTilesInUseAttr, rewriter.getI32IntegerAttr((unsigned)tilesInUse));
+    });
 
     return success();
   }
